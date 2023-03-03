@@ -1,0 +1,1120 @@
+---
+title: "Predicting Chickenpox Cases in Hungary"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, results="hide")
+```
+
+This document contains a time series case study using R.
+
+# Problem and Data
+
+We will be analysing a spatio-temporal dataset of weekly chickenpox (childhood disease) cases from Hungary. The dataset consists of a time series matrix of the number of county-level reported chickenpox cases in Hungary, with (n=522) observations for each county between January 3, 2005 and December 29, 2014. There are 21 columns, the first of which is date, and the remaining 20 of which are counties. The dataset contains no missing values. The main patterns in the country-level data (i.e. the row sums of the number of cases in each region) are as follows: According to the additive classical decomposition plot, seasonality is present in the data. The period is 1 year or 52 weeks. The peak values occur in the winter months, while the low values occur in the summer and fall months. There is a downward trend in the country-level data.
+
+```{r, message=FALSE}
+# load data set
+# change directory
+directory = "../datasets"
+filename = paste(directory, "chickenpox.csv", sep="/")
+df = read.csv(filename, header=TRUE, stringsAsFactors=TRUE)
+# we first analyze cases at the country level
+cases = rowSums(df[,-1])
+chickenpox = ts(cases, start=2005, frequency=52)
+```
+
+```{r}
+plot(decompose(chickenpox))
+```
+
+The objective of this project is to find an appropriate model to forecast the number of Hungarian chickenpox cases at the country level.
+
+One concern about this dataset is that the seasonal period is long. Time series techniques such as auto-correlation (ACF) plot and seasonal auto-regressive integrated moving average (SARIMA) are generally designed for shorter periods such as 12 for monthly data and 4 for quarterly data. Although the power of those techniques may be compromised for data with long seasonal periods, we will apply those techniques along with others, in search of the optimal forecasting model for this dataset. For ACF plots, we will only consider shorter lags and leave out longer lags that are less reliable. As to SARIMA, long seasonal periods make it more challenging to identify the model parameters. We will perform a grid search for the optimal SARIMA parameters where appropriate.
+
+Another concern is whether the model for the country-level data is applicable to the county-level data. We will determine an appropriate model for the country-level data first; then we will fit the model on the county-level data and evaluate the predictive performance of the model on the county level.
+
+\newpage
+
+# Statistical Analysis
+
+To evaluate the predictive performance of the models, we divide the data into two non-overlapping subsets:
+
+- training set of the first 470 observations (from January 3, 2005 to December 30, 2013)
+
+- test set of the last 52 observations (from January 6, 2014 to December 29, 2014)
+
+```{r}
+# split training and test data
+# the last 52 data points are test data
+val_n = 52
+chickenpox.train = ts(cases[1:(522-val_n)], start=2005, frequency=52)
+chickenpox.test = ts(cases[(522-val_n+1):522], start=c(2014,3), frequency=52)
+# plot training and test data
+plot(chickenpox.train, main="Weekly Chickenpox Cases in Hungary",
+     xlab="Weeks", ylab="Weekly chickenpox cases", xlim=c(2005,2015))
+lines(chickenpox.test, col="blue")
+legend("topright", legend=c("Training", "Test"), col=c("black", "blue"), lty=1)
+```
+
+Our statistical analysis of the country-level data consists of the following steps:
+
+1. Stabilize the variance of the training data  
+2. Remove the trend and seasonality from the training data, making the training data stationary  
+3. Model the stationary data  
+4. Forecast, then add non-stationarity and any transformation back to the forecast  
+5. Evaluate the predictive performance of the model
+
+We will fit the following models and perform forecasting with these methods:
+
+- Linear regression and penalized regression on power transformed data  
+- Holt-Winters Algorithm on original data  
+- Linear regression and penalized regression as smoothing methods on power transformed data, combined with AR(I)MA  
+- SARIMA on power transformed data
+
+\newpage
+
+## Variance Stabilization
+
+In some time series data, the variance is unstable, or in other words, the variance changes over time. That is a source of non-stationarity and makes the data more difficult to analyze. Techniques such as linear regression, differencing and Box-Jenkins models are based on the assumptions that the input time series data has constant variance over time.
+
+To stabilizae the variance, we will apply power transformation of different powers $\alpha$ to the dataset and choose the power $\alpha$ with the highest p-value by Fligner-Killeen Test. For the Fligner-Killeen Test, we will divide the data into 9 consecutive groups. High p-value ($> 0.05$) by Fligner-Killeen Test means there is low evidence against constant variance across the various groups, whereas low p-value ($\leq 0.05$) by Fligner-Killeen Test means there is evidence against constant variance across the various groups.
+
+```{r}
+# power transformation function
+powerTransform = function(y, alpha) {
+  if (alpha == 0) {
+    log(y)
+  } else {
+    y^alpha
+  }
+}
+# apply power transformation of different alpha values to random component
+alphas = seq(-2, 2, 0.25)
+# select optimal alpha by Fligner-Killeen Test
+seg = c(rep(1:9, each=52), rep(9, length(chickenpox.train)-9*52))
+p.values = lapply(alphas, function(a){
+  fligner.test(powerTransform(chickenpox.train, a), seg)$p.value})
+cat("Select alpha for power transformation from:", alphas, "\n")
+```
+
+The following is a plot of Fligner p-values vs. power $\alpha$.
+
+```{r}
+plot(alphas, p.values, main="Fligner-Killeen Test for Constant Variance",
+     xlab="Alphas", ylab="Fligner p-values")
+abline(h=0.05, col="red")
+```
+
+We choose $\alpha = 0$ (log), which leads to a large Fligner p-value $> 0.05$.
+
+We provide a plot of the original data set and a plot of the power transformed data set. Note that the power transformed data appears to have stable variance.
+
+```{r fig1, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+alpha = 0
+plot(chickenpox.train, main="Original Training Data",
+     xlab="Weeks", ylab="Weekly cases")
+chickenpox.train.pt = powerTransform(chickenpox.train, alpha)
+plot(chickenpox.train.pt,
+     main=paste("Power Transformed Training Data ( alpha =",alpha,")"),
+     xlab="Weeks", ylab="Power transformed weekly cases")
+```
+
+
+\newpage
+
+## Trend and Seasonality
+
+After the variance is stabilized, we model the trend and/or seasonality in the data set, which are both deterministic.
+
+In this section, we will fit the models on the training set. The models that will be considered in this section include penalized regression, differencing, and Holt-Winters.
+
+Before we fit the models, we give a time series plot as well as an ACF plot of the power transformed data, from which we identify the sources of non-stationarity.
+
+```{r, fig.height = 4, fig.width = 7}
+plot(chickenpox.train.pt, main="Power Transformed Training Data",
+     xlab="Weeks", ylab="Power transformed cases")
+```
+
+```{r, fig.height = 4, fig.width = 7}
+acf(chickenpox.train.pt, main="ACF Plot of Power Transformed Training Data")
+```
+
+For convenience, the power transformed training data will be referred to as the data. 
+
+There is clearly seasonality and a decreasing trend in the data. The time series plot shows a seasonal period of 1 year, or 52 weeks. The time series plot also shows a decreasing trend on top of the seasonality. The ACF plot shows a decrease in amplitude of sinusoidal waves with increase in lag, which gives evidence for a trend. Note that the larger lags in the ACF plot are not reliable, so we do not focus on the evidence given by the ACF plot.
+
+The data is not stationary. Both trend and seasonality needs to be extracted from the data.
+
+### Regression
+
+Linear regression attempts to model one variable based on the values of some other variables by fitting a linear equation (i.e. a polynomial) to observed data. The coefficient estimates should minimize a loss function that involves residuals, usually the mean squared residuals.
+
+Penalized regression is a form of regression that shrinks the coefficient estimates towards 0 by adding a weighted penalty function to the objective function, i.e., we now aim to minimize the sum of loss function and weighted penalty function.
+
+Procedure:
+
+We iterate through multiple polynomial degrees (1 to 12 inclusive) of time points, and multiple $\alpha$ values ($0$ to $1$ with $0.1$ intervals). We also include indicator variables for weeks of the year ($51$ indicator variables) in our model and then pick those models that have the greatest prediction power to be our optimal models. The prediction MSE and the prediction MAE are our measures of prediction power. After that, we perform residual diagnostics to see if the residuals are normal, have constant mean and variance and are independent (uncorrelated). Lastly, the optimal models that pass the diagnostics can be used to predict chickenpox cases in the future.
+
+To start the procedure, we fit elastic net models using different parameters: polynomial degrees (1 to 12 inclusive) of time points, and multiple $\alpha$ values ($0$ to $1$ with $0.1$ intervals). We use $\texttt{lambda.min}$ from the $\texttt{cv.glmnet}$ function, which may be $0$ (linear regression), or may not be $0$ (penalized regression including lasso, ridge, and elastic net). For each polynomial degree and each $\alpha$ value, we execute the $\texttt{cv.glmnet}$ function twice, once with the MSE measure, and once with the MAE measure. We will choose the polynomial degree and the $\alpha$ value that leads to the lowest prediction MSE and prediction MAE.
+
+```{r}
+# potential polynomial degrees
+P.sequence = 1:12
+# potential alpha values for elastic net parameter
+alphas = seq(0, 1, by = 0.1)
+# predictors or explanatory variables
+Time = 1:length(chickenpox)
+Weeks = as.factor(cycle(chickenpox))
+Weeks.training = Weeks[1:(522-val_n)]
+Weeks.test = Weeks[(522-val_n+1):522]
+Cases.training = chickenpox.train.pt[1:(522-val_n)]
+Cases.test = chickenpox.train.pt[(522-val_n+1):522]
+# will modify variables below in the for loops
+CV.fit = matrix(rep(0,length(P.sequence)*length(alphas)), 
+  nrow=length(P.sequence), ncol=length(alphas))
+CV.predict1 = matrix(rep(0,length(P.sequence)*length(alphas)), 
+  nrow=length(P.sequence), ncol=length(alphas))
+CV.predict2 = matrix(rep(0,length(P.sequence)*length(alphas)), 
+  nrow=length(P.sequence), ncol=length(alphas))
+Minimum.Lambda1 = matrix(rep(0,length(P.sequence)*length(alphas)), 
+  nrow=length(P.sequence), ncol=length(alphas))
+Minimum.Lambda2 = matrix(rep(0,length(P.sequence)*length(alphas)), 
+  nrow=length(P.sequence), ncol=length(alphas))
+```
+
+```{r, message=FALSE}
+library(glmnet)
+set.seed(12345678)
+for (a in alphas) { # iterating through alpha values
+  cat("##### Elastic Net Alpha =", a, "#####\n")
+  # perform cv.glmnet for alpha = a using mse loss
+  for (p in P.sequence) {
+    # fit
+    Time.training = poly(Time, p, simple=TRUE)[1:(522-val_n),]
+    temp = data.frame(Cases.training, Time.training, Weeks.training)
+    temp$Weeks.training = as.factor(temp$Weeks.training)
+    # design matrix, without the first column for intercept
+    x_train = model.matrix(~Time.training+Weeks.training, temp[,-1])[,-1]
+    CV = cv.glmnet(x=x_train, y=Cases.training, type.measure="mse", alpha=a)
+    # MS residuals
+    CV.fit[p, (10*a+1)] = min(CV$cvm)
+    Minimum.Lambda1[p, (10*a+1)] = CV$lambda.min
+    # predict
+    Time.test = poly(Time, p, raw=FALSE, simple=TRUE)[(522-val_n+1):522,]
+    temp = data.frame(Cases.test, Time.test, Weeks.test)
+    temp$Weeks.test = as.factor(temp$Weeks.test)
+    # design matrix, without the first column for intercept
+    x_test = model.matrix(~Time.test+Weeks.test, temp[,-1])[,-1]
+    # prediction MSE
+    CV.predict1[p, (10*a+1)] = mean(
+      (chickenpox.test-exp(predict(CV, newx=x_test, s="lambda.min")))^2)
+  }
+  optimum.p = which.min(CV.fit[,(10*a+1)])
+  min.lambda = Minimum.Lambda1[optimum.p, (10*a+1)]
+  cat("  Based on Mean Squared Residuals\n")
+  cat("    Optimal poly degree:",optimum.p," , Optimal lambda:",min.lambda,"\n")
+  optimum.p = which.min(CV.predict1[,(10*a+1)])
+  cat("  Based on prediction MSE\n")
+  min.lambda = Minimum.Lambda1[optimum.p, (10*a+1)]
+  cat("    Optimal poly degree:",optimum.p," , Optimal lambda:",min.lambda,"\n")
+  # perform cv.glmnet for alpha = a using mae loss
+  for (p in P.sequence) {
+    # fit
+    Time.training = poly(Time, p, raw=FALSE, simple=TRUE)[1:(522-val_n),]
+    temp = data.frame(Cases.training, Time.training, Weeks.training)
+    temp$Weeks.training = as.factor(temp$Weeks.training)
+    # design matrix, without the first column for intercept
+    x_train = model.matrix(~Time.training+Weeks.training, temp[,-1])[,-1]
+    CV = cv.glmnet(x=x_train, y=Cases.training, type.measure="mae", alpha=a)
+    # MS residuals
+    CV.fit[p, (10*a+1)] = min(CV$cvm)
+    Minimum.Lambda2[p, (10*a+1)] = CV$lambda.min
+    # predict
+    Time.test = poly(Time, p, raw=FALSE, simple=TRUE)[(522-val_n+1):522,]
+    temp = data.frame(Cases.test, Time.test, Weeks.test)
+    temp$Weeks.test = as.factor(temp$Weeks.test)
+    # design matrix, without the first column for intercept
+    x_test = model.matrix(~Time.test+Weeks.test, temp[,-1])[,-1]
+    # prediction MAE
+    CV.predict2[p, (10*a+1)] = mean(abs(
+      chickenpox.test-exp(predict(CV, newx=x_test, s="lambda.min"))))
+  }
+  optimum.p = which.min(CV.fit[,(10*a+1)])
+  min.lambda = Minimum.Lambda2[optimum.p, (10*a+1)]
+  cat("  Based on Mean Absolute Residuals\n")
+  cat("    Optimal poly degree:",optimum.p," , Optimal lambda:",min.lambda,"\n")
+  optimum.p = which.min(CV.predict2[,(10*a+1)])
+  cat("  Based on prediction MAE\n")
+  min.lambda = Minimum.Lambda2[optimum.p, (10*a+1)]
+  cat("    Optimal poly degree:",optimum.p," , Optimal lambda:",min.lambda,"\n")
+}
+```
+
+```{r}
+# optimal prediction MSE
+cat("Parameters that lead to the lowest prediction MSE\n")
+which(CV.predict1 == min(CV.predict1), arr.ind=TRUE)
+# optimal prediction MAE
+cat("Parameters that lead to the lowest prediction MAE\n")
+which(CV.predict2 == min(CV.predict2), arr.ind=TRUE)
+```
+
+Model 1: The elastic net model with $\alpha=0$ and polynomial degree $6$ gives the lowest prediction MSE.  
+Model 2: The elastic net model with $\alpha=0$ and polynomial degree $1$ gives the lowest prediction MAE. 
+
+We make predictions using the two optimal models.
+
+```{r}
+# fit
+p = P.sequence[6]
+a = alphas[1]
+Time.training = poly(Time, p, raw=FALSE, simple=TRUE)[1:(522-val_n),]
+temp = data.frame(Cases.training, Time.training, Weeks.training)
+temp$Weeks.training = as.factor(temp$Weeks.training)
+# design matrix, without the first column for intercept
+x_train = model.matrix(~Time.training+Weeks.training, temp[,-1])[,-1]
+net = glmnet(x_train, Cases.training,
+             alpha=a, lambda=Minimum.Lambda1[6, 1])
+# predict
+Tim = poly(Time, p, raw=FALSE, simple=TRUE)
+temp = data.frame(log(chickenpox), Tim, Weeks)
+temp$Weeks = as.factor(temp$Weeks)
+# design matrix, without the first column for intercept
+x_test = model.matrix(~Tim+Weeks, temp[,-1])[,-1]
+# predictions
+values1 = predict(net, newx=x_test, s=Minimum.Lambda1[6, 1])
+
+# fit
+p = P.sequence[1]
+a = alphas[1]
+Time.training = poly(Time, p, raw=FALSE, simple=TRUE)[1:(522-val_n),]
+temp = data.frame(Cases.training, Time.training, Weeks.training)
+temp$Weeks.training = as.factor(temp$Weeks.training)
+# design matrix, without the first column for intercept
+x_train = model.matrix(~Time.training+Weeks.training, temp[,-1])[,-1]
+net = glmnet(x_train, Cases.training,
+             alpha=a, lambda=Minimum.Lambda1[1, 1])
+# predict
+Tim = poly(Time, p, raw=FALSE, simple=TRUE)
+temp = data.frame(log(chickenpox), Tim, Weeks)
+temp$Weeks = as.factor(temp$Weeks)
+# design matrix, without the first column for intercept
+x_test = model.matrix(~Tim+Weeks, temp[,-1])[,-1]
+# predictions
+values2 = predict(net, newx=x_test, s=Minimum.Lambda1[1, 1])
+
+cat("Prediction MSE of Model 1",
+    mean((chickenpox.test-exp(values1)[(522-val_n+1):522])^2),"\n")
+cat("Prediction MAE of Model 2",
+    mean(abs(chickenpox.test-exp(values2)[(522-val_n+1):522])))
+```
+
+Now, we perform residual diagnostics on the two optimal models. In this case, the residuals are the differences between the power transformed training data and the fitted values.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+chickenpox.residuals1 = chickenpox.train.pt-values1[1:(522-val_n)]
+plot(chickenpox.residuals1, main="Residuals of Model1",
+     ylab="Residuals")
+acf(chickenpox.residuals1, main="ACF Plot of Model1", lag.max=52)
+```
+
+```{r, fig.height = 4, fig.width = 8}
+par(mfrow=c(1,2))
+
+plot(values1[1:(522-val_n)], chickenpox.residuals1,
+     main="Residuals vs. Fitted Values\nfor Model1",
+     xlab="Fitted values", ylab="Residuals")
+abline(a=0, b=0,col="Red")
+car::qqPlot(chickenpox.residuals1, main="Normal Q-Q Plot",
+            xlab="Theoretical Quantiles (Normal)", ylab="Sample Quantiles")
+```
+
+```{r}
+shapiro.test(chickenpox.residuals1)
+```
+Shapiro-Wilk normality test gives a p-value of $7.24 \times 10^{-14} < 0.05$ .
+
+For the first optimal model (Ridge, Polynomial of degree 6), the residuals appear to have constant mean and constant variance. Based on the ACF plot, there appears to be some correlation among the residuals. The residuals are not normally distributed, since the Shapiro Test gives strong evidence against normality (p-value $< 0.05$).
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+chickenpox.residuals2 = chickenpox.train.pt-values2[1:(522-val_n)]
+plot(chickenpox.residuals2, main="Residuals of Model2",
+     ylab="Residuals")
+acf(chickenpox.residuals2, main="ACF Plot of Model2", lag.max=52)
+```
+
+```{r, fig.height = 4, fig.width = 8}
+par(mfrow=c(1,2))
+plot(values2[1:(522-val_n)], chickenpox.residuals2,
+     main="Residuals vs. Fitted Values\nfor p=1, alpha=0",
+     xlab="Fitted values", ylab="Residuals")
+abline(a=0, b=0,col="Red")
+car::qqPlot(chickenpox.residuals2, main="Normal Q-Q Plot",
+            xlab="Theoretical Quantiles (Normal)", ylab="Sample Quantiles")
+```
+
+```{r}
+shapiro.test(chickenpox.residuals2)
+```
+The Shapiro test gives a p-value of $5.64 \times 10^{-14} < 0.05$ .
+
+For the second optimal model (Ridge, Polynomial of degree 1), the residuals appear to have constant mean and constant variance. Based on the ACF plot, there appears to be some correlation among the residuals. The residuals are not normally distributed, since the Shapiro Test gives strong evidence against normality (p-value $< 0.05$).
+
+Lastly, we plot the two optimal models and their corresponding predictions.
+
+```{r}
+plot(chickenpox, xlab="Weeks", ylab="Chickenpox Cases")
+lines(ts(exp(values1), start=2005, frequency=52), col=2)
+lines(ts(exp(values2), start=2005, frequency=52), col=3)
+legend("topright",
+       legend = c("(alpha = 0, p = 6) [MSE]", "(alpha = 0, p = 1) [MAE]"),
+       col=2:3, lty=1)
+```
+
+The prediction MSEs of the two optimal models are as follows:
+
+```{r, results='hold'}
+pred.mse1 = mean((chickenpox.test-exp(values1[(522-val_n+1):522]))^2)
+pred.mse2 = mean((chickenpox.test-exp(values2[(522-val_n+1):522]))^2)
+pred.mses = data.frame(Models=c("Ridge, Polynomial of degree 6",
+                                "Ridge, Polynomial of degree 1"),
+                       Pred.MSE=round(c(pred.mse1, pred.mse2), 2))
+knitr::kable(pred.mses)
+```
+
+### Differencing
+
+Differencing is a time series transformation that aims at making a non-stationary dataset stationary. An outline of the differencing procedure is:
+
+- Try first order differencing to get rid of trend and/or seasonality. If there is still trend in the data, try second order differencing.
+
+- If there is still seasonality in the data, try seasonal differencing to get rid of periodicity. 
+
+- Perform as little differencing as possible since it increases the variance of the dataset. Avoid over-differencing.
+
+We will perform differencing on the power transformed training data.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+chickenpox.train.diff = diff(chickenpox.train.pt, difference=1)
+plot(chickenpox.train.diff, main="First Order Differencing",
+     xlab="Weeks", ylab="Diff of Weekly Cases")
+acf(chickenpox.train.diff, main="First Order Differencing", lag.max=52)
+```
+
+First order differencing removes trend from the data. The ACF plot of the differenced data does not show a slow linear decay of the lags. However, first order differencing does not remove seasonality from the data. The time series plot shows a seasonal behaviour of period 1 year, or 52 weeks.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+chickenpox.train.diff20 = diff(chickenpox.train.pt, difference=2)
+plot(chickenpox.train.diff20, main="Second Order Differencing",
+     xlab="Weeks", ylab="Diff of Weekly Cases")
+acf(chickenpox.train.diff20, main="Second Order Differencing", lag.max=52)
+```
+
+Second order differencing removes trend from the data. The ACF plot of the differenced data does not show a slow linear decay of the lags. The time series plot does not show a trend. Second order also removes seasonality from the data. The time series plot does not show a periodic behaviour. In the time series plot, the variance of the data appears to be constant over time. The second order differenced data is stationary.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+chickenpox.train.diff01 = diff(chickenpox.train.pt, lag=52)
+plot(chickenpox.train.diff01, main="Seasonal Differencing in Lag 52",
+     xlab="Weeks", ylab="Diff of Weekly Cases")
+acf(chickenpox.train.diff01, main="Seasonal Differencing in Lag 52", lag.max=52)
+```
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+chickenpox.train.diff11 = diff(chickenpox.train.diff01, differences=1)
+plot(chickenpox.train.diff11, main=" Regular and Seasonal Differencing\nin Lag 52",
+     xlab="Weeks", ylab="Diff of Weekly Cases")
+acf(chickenpox.train.diff11,
+    main="Regular and Seasonal Differencing\nin Lag 52", lag.max=52)
+```
+
+We want to avoid over-differencing. We will use second order differencing to make the data stationary.
+
+
+\newpage
+
+### Holt-Winters
+
+Holt-Winters Algorithm serves to perform smoothing on a time series dataset and make predictions for future time points.
+
+Since both trend and seasonality are present in the data, we will execute additive Holt-Winters Algorithm and multiplicative Holt-Winters Algorithm on the training data without power transformation. We will investigate the smoothing performance of the two. We will also investigate which of the two gives better predictive performance for the dataset. The reason we apply Holt-Winters Algorithm to the data without power transformation as opposed to the data with transformation is because we have seen that Holt-Winters can accommodate non-constant variance for some datasets, and we want to see if this is the case for the Hungarian chickenpox dataset.
+
+First, we execute the additive Holt-Winters Algorithm and make predictions for the test set.
+
+```{r}
+# fit additive Holt-Winters
+hw.add = HoltWinters(chickenpox.train)
+hw.add
+```
+
+```{r}
+# predict 52 weeks ahead using additive Holt-Winters
+hw.add.predict = predict(hw.add, n.ahead=val_n, prediction.interval=TRUE, level=0.95)
+# fitted and predicted values by additive Holt-Winters
+plot(hw.add, hw.add.predict, main="Holt-Winters Smoothing (Additive)")
+```
+
+The additive Holt-Winters Algorithm gives reasonabe predictions for early 2014. However, the predictions for the rest of 2014 are not reasonable. Some predicted values and prediction intervals are negative. The number of chickenpox cases cannot be negative.
+
+
+Next, we execute the multiplicative Holt-Winters Algorithm and make predictions for the test set.
+
+```{r}
+# fit multiplicative Holt-Winters
+hw.mult = HoltWinters(chickenpox.train, seasonal="multiplicative")
+hw.mult
+```
+
+```{r}
+# predict 52 weeks ahead using multiplicative Holt-Winters
+hw.mult.predict = predict(hw.mult, n.ahead=val_n, prediction.interval=TRUE, level=0.95)
+# fitted and predicted values by multiplicative Holt-Winters
+plot(hw.mult, hw.mult.predict, main="Holt-Winters Smoothing (Multiplicative)")
+```
+
+The multiplicative Holt-Winters Algorithm does not give reasonable predictions for early 2014. It appears that the model underestimates the peak values. The predictions for the rest of 2014 are reasonable. The predicted low values are close to the observed low values, and they appear to match the observed pattern. The prediction intervals are unreasonably wide, which does not give useful information in the context of chickenpox cases.
+
+Then, we check if the data by the Holt-Winters Algorithm is stationary.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+plot(chickenpox.train-hw.add$fitted[,"xhat"],
+     main="Holt-Winters Smoothing Residuals (Additive)", xlab="Weeks", ylab="Residuals")
+acf(chickenpox.train-hw.add$fitted[,"xhat"],
+    main="Holt-Winters Smoothing Residuals (Additive)", lag.max=150)
+```
+
+The data by additive Holt-Winters is not stationary. There is no trend in the time series plot. The ACF plot does not show a slow decay of the lags or a periodic behaviour. However, the variance is not constant over time. It appears that the variance is higher in the first half of each year, and lower in the second half of each year.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+plot(chickenpox.train-hw.mult$fitted[,"xhat"],
+     main="Holt-Winters Smoothing Residuals (Multiplicative)", xlab="Weeks", ylab="Residuals")
+acf(chickenpox.train-hw.mult$fitted[,"xhat"],
+    main="Holt-Winters Smoothing Residuals (Multiplicative)", lag.max=150)
+```
+
+The data by multiplicative Holt-Winters is not stationary. There is no trend in the time series plot. The ACF plot does not show a slow decay of the lags or a periodic behaviour. However, the variance is not constant over time. It appears that the variance is higher in the first half of each year, and lower in the second half of each year.
+
+Holt-Winters Algorithm does not accommodate the unstable variance for this dataset. We applied Holt-Winters Algorithm to the original dataset rather than the power transformed dataset. The residuals are not stationary.
+
+Lastly, we compare the prediction performance of additive Holt-Winters Algorithm with multiplicative Holt-Winters Algorithm.
+
+```{r}
+par(mfrow=c(1,2))
+# plot observed vs. predicted values using additive Holt-Winters
+plot(as.vector(hw.add.predict[,"fit"]), chickenpox.test,
+     main="Observed vs. Predicted Values\n(Additive)",
+     xlab="Predicted values", ylab="Observed values", xlim=c(-500, 1500),
+     pch=19, col=adjustcolor("black", alpha=0.4))
+abline(0, 1, col="red")
+# plot observed vs. predicted values using multiplicative Holt-Winters
+plot(as.vector(hw.mult.predict[,"fit"]), chickenpox.test,
+     main="Observed vs. Predicted Values\n(Multiplicative)",
+     xlab="Predicted values", ylab="Observed values", xlim=c(-500, 1500),
+     pch=19, col=adjustcolor("black", alpha=0.4))
+abline(0, 1, col="red")
+```
+
+```{r}
+hw.add.predMSE = mean((chickenpox.test-hw.add.predict[,"fit"])^2)
+hw.mult.predMSE = mean((chickenpox.test-hw.mult.predict[,"fit"])^2)
+
+pred.mses = data.frame(Models=c("Additive Holt-Winters",
+                                "Multiplicative Holt-Winters"),
+                       Pred.MSE=round(c(hw.add.predMSE,
+                                        hw.mult.predMSE), 2))
+knitr::kable(pred.mses)
+```
+
+The multiplicative Holt-Winters Algorithm gives better predictions for the test data compared to the additive Holt-Winters Algorithm. The prediction MSE for the multiplicative model is lower than the prediction MSE for the additive model. Although the additive model underestimates the low values and the multiplicative model underestimates the peak values, we can see that the predicted values by the multiplicative model are closer to the observed values.
+
+While neither model gives good predictions for the test data, it is amazing that a model as simple as Holt-Winters can capture some, if not all of the trend and seasonal effects.
+
+
+\newpage
+
+## Box-Jenkins Models
+
+Now that the data has been detrendized and deseasonalized, we apply Box-Jenkins models to the data. Box-Jenkins models include auto-regressive moving average models (ARMA), auto-regressive integrated moving average (ARIMA), and seasonal auto-regressive integrated moving average (SARIMA). 
+
+### Penalized Regression + AR(I)MA
+
+Let's examine the ACF and PACF plots of the two best models from the penalized regression section. Model 1: Ridge regression with polynomial of degree 6. Model 2: Ridge regression with polynomial of degree 1.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+acf(chickenpox.residuals1, main="ACF Plot of Residuals of Model1", lag.max=52)
+pacf(chickenpox.residuals1, main="PACF Plot of Residuals of Model1", lag.max=52)
+```
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+acf(chickenpox.residuals2, main="ACF Plot of Residuals of Model2")
+pacf(chickenpox.residuals2, main="PACF Plot of Residuals of Model2", lag.max=52)
+```
+
+For both penalized regression models, we propose the following values for the parameters in an $\text{ARMA}(p,q)$ model:
+
+Propose $p = 3, q=0$ 
+
+Reason: The PACF plot cuts off after lag 3. The ACF plot shows an exponential decay.
+
+Propose $p = 1, q=1$ 
+
+Propose $p = 1, q=2$ 
+
+Propose $p = 1, q=3$ 
+
+Propose $p = 2, q=1$ 
+
+Propose $p = 2, q=2$ 
+
+Propose $p = 2, q=3$ 
+
+Propose $p = 3, q=1$ 
+
+Propose $p = 3, q=2$ 
+
+Propose $p = 3, q=3$ 
+
+Reason: Both the PACF plot and the ACF plot show exponential decay.
+
+Additionally, the residuals of both penalized regression models seem to have ACF plots with gradual decay. So we thought it would be best to difference the residuals ($d=1$) and examine the resulting ACF and PACF plots.
+
+```{r, fig.height = 7, fig.width = 8}
+res1.d=diff(chickenpox.residuals1,difference=1)
+par(mfrow=c(2,1))
+acf(res1.d, main="ACF Plot of Differenced Residuals of Model1", lag.max=52)
+pacf(res1.d, main="PACF Plot of Differenced Residuals of Model1", lag.max=52)
+```
+
+```{r, fig.height = 7, fig.width = 8}
+res2.d=diff(chickenpox.residuals2,difference=1)
+par(mfrow=c(2,1))
+acf(res2.d, main="ACF Plot of Differenced Residuals of Model2", lag.max=52)
+pacf(res2.d, main="PACF Plot of Differenced Residuals of Model2", lag.max=52)
+```
+
+For both penalized regression models, we propose $d=1$ and the following values for the other parameters in an $\text{ARIMA(p,d,q)}$ model:
+
+Propose $p = 0, q=1$ 
+
+Reason: The ACF plot cuts off after lag 1. The PACF plot shows an exponential decay.
+
+```{r, results=FALSE, fig.keep='none'}
+library(astsa)
+#fit Box-Jenkins
+Model01i = sarima(chickenpox.residuals1, p=3, d=0, q=0, details = TRUE)
+Model02i = sarima(chickenpox.residuals1, p=1, d=0, q=1, details = TRUE)
+Model03i = sarima(chickenpox.residuals1, p=1, d=0, q=2, details = TRUE)
+Model04i = sarima(chickenpox.residuals1, p=1, d=0, q=3, details = TRUE)
+Model05i = sarima(chickenpox.residuals1, p=2, d=0, q=1, details = TRUE)
+Model06i = sarima(chickenpox.residuals1, p=2, d=0, q=2, details = TRUE)
+Model07i = sarima(chickenpox.residuals1, p=2, d=0, q=3, details = TRUE)
+Model08i = sarima(chickenpox.residuals1, p=3, d=0, q=1, details = TRUE)
+Model09i = sarima(chickenpox.residuals1, p=3, d=0, q=2, details = TRUE)
+Model10i = sarima(chickenpox.residuals1, p=3, d=0, q=3, details = TRUE)
+Model11i = sarima(chickenpox.residuals1, p=0, d=1, q=1, details = TRUE)
+
+Model01ii = sarima(chickenpox.residuals2, p=3, d=0, q=0, details = TRUE)
+Model02ii = sarima(chickenpox.residuals2, p=1, d=0, q=1, details = TRUE)
+Model03ii = sarima(chickenpox.residuals2, p=1, d=0, q=2, details = TRUE)
+Model04ii = sarima(chickenpox.residuals2, p=1, d=0, q=3, details = TRUE)
+Model05ii = sarima(chickenpox.residuals2, p=2, d=0, q=1, details = TRUE)
+Model06ii = sarima(chickenpox.residuals2, p=2, d=0, q=2, details = TRUE)
+Model07ii = sarima(chickenpox.residuals2, p=2, d=0, q=3, details = TRUE)
+Model08ii = sarima(chickenpox.residuals2, p=3, d=0, q=1, details = TRUE)
+Model09ii = sarima(chickenpox.residuals2, p=3, d=0, q=2, details = TRUE)
+Model10ii = sarima(chickenpox.residuals2, p=3, d=0, q=3, details = TRUE)
+Model11ii = sarima(chickenpox.residuals2, p=0, d=1, q=1, details = TRUE)
+```
+
+All of the AR(I)MA models have residuals with constant mean and constant variance, and have ACF plots showing uncorrelatedness, but the residuals fail the normality requirement.
+
+We fit the AR(I)MA models and make predictions for the test data.
+
+```{r, results=FALSE, fig.keep='none'}
+# predict 52 ahead
+pred.Model01i = sarima.for(chickenpox.residuals1, p=3, d=0, q=0, n.ahead = 52)
+pred.Model02i = sarima.for(chickenpox.residuals1, p=1, d=0, q=1, n.ahead = 52)
+pred.Model03i = sarima.for(chickenpox.residuals1, p=1, d=0, q=2, n.ahead = 52)
+pred.Model04i = sarima.for(chickenpox.residuals1, p=1, d=0, q=3, n.ahead = 52)
+pred.Model05i = sarima.for(chickenpox.residuals1, p=2, d=0, q=1, n.ahead = 52)
+pred.Model06i = sarima.for(chickenpox.residuals1, p=2, d=0, q=2, n.ahead = 52)
+pred.Model07i = sarima.for(chickenpox.residuals1, p=2, d=0, q=3, n.ahead = 52)
+pred.Model08i = sarima.for(chickenpox.residuals1, p=3, d=0, q=1, n.ahead = 52)
+pred.Model09i = sarima.for(chickenpox.residuals1, p=3, d=0, q=2, n.ahead = 52)
+pred.Model10i = sarima.for(chickenpox.residuals1, p=3, d=0, q=3, n.ahead = 52)
+pred.Model11i = sarima.for(chickenpox.residuals1, p=0, d=1, q=1, n.ahead = 52)
+
+pred.Model01ii = sarima.for(chickenpox.residuals2, p=3, d=0, q=0, n.ahead = 52)
+pred.Model02ii = sarima.for(chickenpox.residuals2, p=1, d=0, q=1, n.ahead = 52)
+pred.Model03ii = sarima.for(chickenpox.residuals2, p=1, d=0, q=2, n.ahead = 52)
+pred.Model04ii = sarima.for(chickenpox.residuals2, p=1, d=0, q=3, n.ahead = 52)
+pred.Model05ii = sarima.for(chickenpox.residuals2, p=2, d=0, q=1, n.ahead = 52)
+pred.Model06ii = sarima.for(chickenpox.residuals2, p=2, d=0, q=2, n.ahead = 52)
+pred.Model07ii = sarima.for(chickenpox.residuals2, p=2, d=0, q=3, n.ahead = 52)
+pred.Model08ii = sarima.for(chickenpox.residuals2, p=3, d=0, q=1, n.ahead = 52)
+pred.Model09ii = sarima.for(chickenpox.residuals2, p=3, d=0, q=2, n.ahead = 52)
+pred.Model10ii = sarima.for(chickenpox.residuals2, p=3, d=0, q=3, n.ahead = 52)
+pred.Model11ii = sarima.for(chickenpox.residuals2, p=0, d=1, q=1, n.ahead = 52)
+
+MSE1 = rep(0,11)
+MSE2 = rep(0,11)
+
+MSE1[1] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model01i$pred))^2)
+MSE1[2] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model02i$pred))^2)
+MSE1[3] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model03i$pred))^2)
+MSE1[4] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model04i$pred))^2)
+MSE1[5] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model05i$pred))^2)
+MSE1[6] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model06i$pred))^2)
+MSE1[7] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model07i$pred))^2)
+MSE1[8] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model08i$pred))^2)
+MSE1[9] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model09i$pred))^2)
+MSE1[10] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model10i$pred))^2)
+MSE1[11] = mean((chickenpox.test - exp(values1[(522-val_n+1):522]+pred.Model11i$pred))^2)
+
+MSE2[1] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model01ii$pred))^2)
+MSE2[2] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model02ii$pred))^2)
+MSE2[3] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model03ii$pred))^2)
+MSE2[4] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model04ii$pred))^2)
+MSE2[5] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model05ii$pred))^2)
+MSE2[6] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model06ii$pred))^2)
+MSE2[7] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model07ii$pred))^2)
+MSE2[8] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model08ii$pred))^2)
+MSE2[9] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model09ii$pred))^2)
+MSE2[10] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model10ii$pred))^2)
+MSE2[11] = mean((chickenpox.test - exp(values2[(522-val_n+1):522]+pred.Model11ii$pred))^2)
+```
+
+Among all the penalized regression + AR(I)MA models, the models that give the lowest prediction MSE:
+
+``` {r}
+cat("AR(I)MA Model that leads to the lowest prediction MSE for Model 1\n")
+which(MSE1 == min(MSE1))
+min(MSE1)
+
+cat("AR(I)MA Model that leads to the lowest prediction MSE for Model 2\n")
+which(MSE2 == min(MSE2))
+min(MSE2)
+
+pred.mses = data.frame(Models=c("Ridge, Polynomial of degree 6 + ARMA(3,3)",
+                                "Ridge, Polynomial of degree 1 + ARMA(1,2)"),
+                       Pred.MSE=round(c(min(MSE1), min(MSE2)), 2))
+knitr::kable(pred.mses)
+```
+
+Using AR(I)MA models with any of the two best penalized regression models increases the prediction MSE. We would prefer to use just the penalized regression models without AR(I)MA since AR(I)MA does not help with the non-normality issue we faced previously and only increases prediction MSE.
+
+
+### SARIMA
+
+In the previous section, we found that second order differencing makes the data stationary, so we will use $\text{SARIMA}(p,d,q)\times (P,D,Q)_s$ with $d = 2, D = 0, s = 52$. To determine the parameters $p, q, P, Q$ in $\text{SARIMA}(p,d,q)\times (P,D,Q)_s$, we plot the ACF and Partial ACF of the stationary data produced by second order differencing.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+acf(chickenpox.train.diff20, main="Second order differencing", lag.max=52)
+pacf(chickenpox.train.diff20, main="Second order differencing", lag.max=52)
+```
+
+We propose the following values for the parameters $p,q, P, Q$:
+
+Propose $p = 0, q=1$
+
+Reason: The ACF plot cuts off after lag 1. The Partial ACF plot shows an exponential decay.
+
+Propose $p=4, q=0$
+
+Reason: The ACF plot shows a damped sine wave. The Partial ACF plot cuts off after lag 4.
+
+Propose $p=1, q=1$ 
+
+Propose $p=1, q=2$
+
+Propose $p=2, q=1$
+
+Propose $p=2, q=2$
+
+Propose $p=3, q=2$
+
+Propose $p=4, q=2$
+
+Reason: The ACF plot shows a damped sine wave. The Partial ACF plot shows an exponential decay.
+
+The ACF and Partial ACF plots both show spikes at lag 52, although the spikes at lag 52 are not reliable. By trial and error, we propose the following values for parameters $P, Q$.
+
+Propose $P = 0, Q = 1$
+
+Propose $P = 1, Q = 0$
+
+Propose $P = 1, Q = 1$
+
+```{r, results=FALSE, fig.keep='none'}
+library(astsa)
+# fit MA(1)
+Model01a = sarima(chickenpox.train.pt, p=0, d=2, q=1, P=0, D=0, Q=1, S=52 , details = TRUE)
+Model02a = sarima(chickenpox.train.pt, p=4, d=2, q=0, P=0, D=0, Q=1, S=52 , details = TRUE)
+Model03a = sarima(chickenpox.train.pt, p=1, d=2, q=1, P=0, D=0, Q=1, S=52 , details = TRUE)
+Model04a = sarima(chickenpox.train.pt, p=1, d=2, q=2, P=0, D=0, Q=1, S=52 , details = TRUE)
+Model05a = sarima(chickenpox.train.pt, p=2, d=2, q=1, P=0, D=0, Q=1, S=52 , details = TRUE)
+Model06a = sarima(chickenpox.train.pt, p=2, d=2, q=2, P=0, D=0, Q=1, S=52 , details = TRUE)
+Model07a = sarima(chickenpox.train.pt, p=3, d=2, q=2, P=0, D=0, Q=1, S=52 , details = TRUE)
+Model08a = sarima(chickenpox.train.pt, p=4, d=2, q=2, P=0, D=0, Q=1, S=52 , details = TRUE)
+```
+
+```{r, results=FALSE, fig.keep='none'}
+library(astsa)
+# fit MA(1)
+Model01a = sarima(chickenpox.train.pt, p=0, d=2, q=1, P=1, D=0, Q=0, S=52 , details = TRUE)
+Model02a = sarima(chickenpox.train.pt, p=4, d=2, q=0, P=1, D=0, Q=0, S=52 , details = TRUE)
+Model03a = sarima(chickenpox.train.pt, p=1, d=2, q=1, P=1, D=0, Q=0, S=52 , details = TRUE)
+#Model04a = sarima(chickenpox.train.pt, p=1, d=2, q=2, P=1, D=0, Q=0, S=52 , details = TRUE) # ERROR
+Model05a = sarima(chickenpox.train.pt, p=2, d=2, q=1, P=1, D=0, Q=0, S=52 , details = TRUE)
+Model06a = sarima(chickenpox.train.pt, p=2, d=2, q=2, P=1, D=0, Q=0, S=52 , details = TRUE)
+Model07a = sarima(chickenpox.train.pt, p=3, d=2, q=2, P=1, D=0, Q=0, S=52 , details = TRUE)
+#Model08a = sarima(chickenpox.train.pt, p=4, d=2, q=2, P=1, D=0, Q=0, S=52 , details = TRUE) # ERROR
+```
+
+```{r, results=FALSE, fig.keep='none'}
+library(astsa)
+# fit MA(1)
+Model01a = sarima(chickenpox.train.pt, p=0, d=2, q=1, P=1, D=0, Q=1, S=52 , details = TRUE)
+Model02a = sarima(chickenpox.train.pt, p=4, d=2, q=0, P=1, D=0, Q=1, S=52 , details = TRUE)
+Model03a = sarima(chickenpox.train.pt, p=1, d=2, q=1, P=1, D=0, Q=1, S=52 , details = TRUE)
+#Model04a = sarima(chickenpox.train.pt, p=1, d=2, q=2, P=1, D=0, Q=1, S=52 , details = TRUE) # ERROR
+Model05a = sarima(chickenpox.train.pt, p=2, d=2, q=1, P=1, D=0, Q=1, S=52 , details = TRUE)
+Model06a = sarima(chickenpox.train.pt, p=2, d=2, q=2, P=1, D=0, Q=1, S=52 , details = TRUE)
+Model07a = sarima(chickenpox.train.pt, p=3, d=2, q=2, P=1, D=0, Q=1, S=52 , details = TRUE)
+#Model08a = sarima(chickenpox.train.pt, p=4, d=2, q=2, P=1, D=0, Q=1, S=52 , details = TRUE) # ERROR
+```
+
+After fitting the proposed models, it is clear that none of the models above passes the model diagnostics.
+
+Recall that seasonal differencing in lag $52$ makes the data relatively stationary, although a small amount of trend is left behind. Given that second order differencing is not an option, we now consider $d = 0, D = 1$ as the parameters in SARIMA.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+acf(chickenpox.train.diff01, main="Seasonal differencing in Lag 52", lag.max=52)
+pacf(chickenpox.train.diff01, main="Seasonal differencing in Lag 52", lag.max=52)
+```
+
+We propose the following values for the parameters $p,q, P, Q$:
+
+Propose $p = 3, q = 0$
+
+Reason: The ACF plot shows an exponential decay. The Partial ACF plot cuts off after lag 3.
+
+Propose $p = 4, q = 0$
+
+Reason: The ACF plot shows an exponential decay. The Partial ACF plot cuts off after lag 4.
+
+Propose $p = 1, q = 1$
+
+Propose $p = 1, q = 2$
+
+Propose $p = 2, q = 1$
+
+Propose $p = 2, q = 2$
+
+Reason: Both the ACF plot and the ACF plot shows an exponential decay.
+
+The ACF and Partial ACF plots both show spikes at lag 52, although the spikes at lag 52 are not reliable. By trial and error, we propose the following values for parameters $P, Q$.
+
+Propose $P = 1, Q = 0$
+
+Propose $P = 0, Q = 1$
+
+Propose $P = 1, Q = 1$
+
+```{r, results=FALSE, fig.keep='none'}
+# fit Box-Jenkins
+Model01b = sarima(chickenpox.train.pt, p=3, d=0, q=0, P=1, D=1, Q=0, S=52 , details = TRUE)
+Model02b = sarima(chickenpox.train.pt, p=4, d=0, q=0, P=1, D=1, Q=0, S=52 , details = TRUE)
+Model03b = sarima(chickenpox.train.pt, p=1, d=0, q=1, P=1, D=1, Q=0, S=52 , details = TRUE)
+Model04b = sarima(chickenpox.train.pt, p=1, d=0, q=2, P=1, D=1, Q=0, S=52 , details = TRUE)
+Model05b = sarima(chickenpox.train.pt, p=2, d=0, q=1, P=1, D=1, Q=0, S=52 , details = TRUE)
+Model06b = sarima(chickenpox.train.pt, p=2, d=0, q=2, P=1, D=1, Q=0, S=52 , details = TRUE)
+```
+
+```{r, results=FALSE, fig.keep='none'}
+# fit Box-Jenkins
+Model07b = sarima(chickenpox.train.pt, p=3, d=0, q=0, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model08b = sarima(chickenpox.train.pt, p=4, d=0, q=0, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model09b = sarima(chickenpox.train.pt, p=1, d=0, q=1, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model10b = sarima(chickenpox.train.pt, p=1, d=0, q=2, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model11b = sarima(chickenpox.train.pt, p=2, d=0, q=1, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model12b = sarima(chickenpox.train.pt, p=2, d=0, q=2, P=0, D=1, Q=1, S=52 , details = TRUE)
+```
+
+```{r, results=FALSE, fig.keep='none'}
+# fit Box-Jenkins
+Model13b = sarima(chickenpox.train.pt, p=3, d=0, q=0, P=1, D=1, Q=1, S=52 , details = TRUE)
+Model14b = sarima(chickenpox.train.pt, p=4, d=0, q=0, P=1, D=1, Q=1, S=52 , details = TRUE)
+Model15b = sarima(chickenpox.train.pt, p=1, d=0, q=1, P=1, D=1, Q=1, S=52 , details = TRUE)
+Model16b = sarima(chickenpox.train.pt, p=1, d=0, q=2, P=1, D=1, Q=1, S=52 , details = TRUE)
+Model17b = sarima(chickenpox.train.pt, p=2, d=0, q=1, P=1, D=1, Q=1, S=52 , details = TRUE)
+Model18b = sarima(chickenpox.train.pt, p=2, d=0, q=2, P=1, D=1, Q=1, S=52 , details = TRUE)
+```
+
+After fitting the proposed models, we decide that the following SARIMA models pass the diagnostics (except normality):   $\text{SARIMA}(3,0,0) \times (0,1,1)_{52}$, $\text{SARIMA}(4,0,0) \times (0,1,1)_{52}$,  
+$\text{SARIMA}(1,0,2) \times (0,1,1)_{52}$, $\text{SARIMA}(2,0,1) \times (0,1,1)_{52}$,  
+$\text{SARIMA}(2,0,2) \times (0,1,1)_{52}$, $\text{SARIMA}(4,0,0) \times (1,1,1)_{52}$,  
+$\text{SARIMA}(2,0,2) \times (1,1,1)_{52}$.
+
+We will make predictions for the test data using those models.
+
+```{r, results=FALSE, fig.keep='none'}
+# predict 52 ahead using WN
+pred.Model.07b = sarima.for(chickenpox.train.pt, p=3, d=0, q=0, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.07b = mean((chickenpox.test - exp(pred.Model.07b$pred))^2)
+pred.Model.08b = sarima.for(chickenpox.train.pt, p=4, d=0, q=0, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.08b = mean((chickenpox.test - exp(pred.Model.08b$pred))^2)
+pred.Model.10b = sarima.for(chickenpox.train.pt, p=1, d=0, q=2, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.10b = mean((chickenpox.test - exp(pred.Model.10b$pred))^2)
+pred.Model.11b = sarima.for(chickenpox.train.pt, p=2, d=0, q=1, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.11b = mean((chickenpox.test - exp(pred.Model.11b$pred))^2)
+pred.Model.12b = sarima.for(chickenpox.train.pt, p=2, d=0, q=2, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.12b = mean((chickenpox.test - exp(pred.Model.12b$pred))^2)
+pred.Model.14b = sarima.for(chickenpox.train.pt, p=4, d=0, q=0, P=1, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.14b = mean((chickenpox.test - exp(pred.Model.14b$pred))^2)
+pred.Model.18b = sarima.for(chickenpox.train.pt, p=2, d=0, q=2, P=1, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.18b = mean((chickenpox.test - exp(pred.Model.18b$pred))^2)
+```
+
+For more SARIMA models, we consider $d=1, D=1$. We saw before that first order differencing followed by seasonal differencing in lag $52$ also makes the data stationary.
+
+```{r, fig.height = 7, fig.width = 8}
+par(mfrow=c(2,1))
+acf(chickenpox.train.diff11, main="Regular and Seasonal differencing\nin Lag 52",
+    lag.max=52)
+pacf(chickenpox.train.diff11, main="Regular and Seasonal differencing\nin Lag 52",
+     lag.max=52)
+```
+
+We propose the following values for the parameters $p,q, P, Q$:
+
+Propose $p = 0, q = 1$
+
+Reason: The ACF plot cuts off after lag 1. The Partial ACF plot shows an exponential decay.
+
+Propose $p = 3, q = 0$
+
+Reason: The ACF plot shows a damped sine wave. The Partial ACF plot cuts off after lag 3.
+
+Propose $p = 1, q = 1$
+
+Propose $p = 1, q = 2$
+
+Propose $p = 2, q = 1$
+
+Propose $p = 2, q = 2$
+
+Propose $p = 3, q = 2$
+
+The ACF and Partial ACF plots both show spikes at lag 52, although the spikes at lag 52 are not reliable. By trial and error, we propose the following values for parameters $P, Q$.
+
+Propose $P = 1, Q = 0$
+
+Propose $P = 0, Q = 1$
+
+Propose $P = 1, Q = 1$
+
+```{r, results=FALSE, fig.keep='none'}
+# fit Box-Jenkins
+Model01c = sarima(chickenpox.train.pt, p=0, d=1, q=1, P=1, D=1, Q=0, S=52 , details = TRUE)
+Model02c = sarima(chickenpox.train.pt, p=3, d=1, q=0, P=1, D=1, Q=0, S=52 , details = TRUE)
+# Model03c = sarima(chickenpox.train.pt, p=1, d=1, q=1, P=1, D=1, Q=0, S=52 , details = TRUE) # ERROR
+Model04c = sarima(chickenpox.train.pt, p=1, d=1, q=2, P=1, D=1, Q=0, S=52 , details = TRUE)
+# Model05c = sarima(chickenpox.train.pt, p=2, d=1, q=1, P=1, D=1, Q=0, S=52 , details = TRUE) # ERROR
+Model06c = sarima(chickenpox.train.pt, p=2, d=1, q=2, P=1, D=1, Q=0, S=52 , details = TRUE)
+# Model07c = sarima(chickenpox.train.pt, p=3, d=1, q=2, P=1, D=1, Q=0, S=52 , details = TRUE) # ERROR
+```
+
+```{r, results=FALSE, fig.keep='none'}
+# fit Box-Jenkins
+Model08c = sarima(chickenpox.train.pt, p=0, d=1, q=1, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model09c = sarima(chickenpox.train.pt, p=3, d=1, q=0, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model10c = sarima(chickenpox.train.pt, p=1, d=1, q=1, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model11c = sarima(chickenpox.train.pt, p=1, d=1, q=2, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model12c = sarima(chickenpox.train.pt, p=2, d=1, q=1, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model13c = sarima(chickenpox.train.pt, p=2, d=1, q=2, P=0, D=1, Q=1, S=52 , details = TRUE)
+Model14c = sarima(chickenpox.train.pt, p=3, d=1, q=2, P=0, D=1, Q=1, S=52 , details = TRUE)
+```
+
+```{r, results=FALSE, fig.keep='none'}
+# fit Box-Jenkins
+Model15c = sarima(chickenpox.train.pt, p=0, d=1, q=1, P=1, D=1, Q=1, S=52 , details = TRUE)
+Model16c = sarima(chickenpox.train.pt, p=3, d=1, q=0, P=1, D=1, Q=1, S=52 , details = TRUE)
+#Model17c = sarima(chickenpox.train.pt, p=1, d=1, q=1, P=1, D=1, Q=1, S=52 , details = TRUE) # ERROR
+#Model18c = sarima(chickenpox.train.pt, p=1, d=1, q=2, P=1, D=1, Q=1, S=52 , details = TRUE) # ERROR
+Model19c = sarima(chickenpox.train.pt, p=2, d=1, q=1, P=1, D=1, Q=1, S=52 , details = TRUE)
+Model20c = sarima(chickenpox.train.pt, p=2, d=1, q=2, P=1, D=1, Q=1, S=52 , details = TRUE)
+Model21c = sarima(chickenpox.train.pt, p=3, d=1, q=2, P=1, D=1, Q=1, S=52 , details = TRUE)
+```
+
+After fitting the proposed models, we decide that the following SARIMA models pass the diagnostics (except normality):  
+$\text{SARIMA}(0,1,1) \times (0,1,1)_{52}$, $\text{SARIMA}(1,1,1) \times (0,1,1)_{52}$,  
+$\text{SARIMA}(1,1,2) \times (0,1,1)_{52}$, $\text{SARIMA}(2,1,1) \times (0,1,1)_{52}$,  
+$\text{SARIMA}(2,1,2) \times (0,1,1)_{52}$, $\text{SARIMA}(3,1,2) \times (0,1,1)_{52}$,  
+$\text{SARIMA}(0,1,1) \times (1,1,1)_{52}$.
+
+We make predictions for the test data using those models.
+
+```{r, results=FALSE, fig.keep='none'}
+# predict 52 ahead using WN
+pred.Model.08c = sarima.for(chickenpox.train.pt, p=0, d=1, q=1, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.08c = mean((chickenpox.test - exp(pred.Model.08c$pred))^2)
+pred.Model.10c = sarima.for(chickenpox.train.pt, p=1, d=1, q=1, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.10c = mean((chickenpox.test - exp(pred.Model.10c$pred))^2)
+pred.Model.11c = sarima.for(chickenpox.train.pt, p=1, d=1, q=2, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.11c = mean((chickenpox.test - exp(pred.Model.11c$pred))^2)
+pred.Model.12c = sarima.for(chickenpox.train.pt, p=2, d=1, q=1, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.12c = mean((chickenpox.test - exp(pred.Model.12c$pred))^2)
+pred.Model.13c = sarima.for(chickenpox.train.pt, p=2, d=1, q=2, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.13c = mean((chickenpox.test - exp(pred.Model.13c$pred))^2)
+pred.Model.14c = sarima.for(chickenpox.train.pt, p=3, d=1, q=2, P=0, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.14c = mean((chickenpox.test - exp(pred.Model.14c$pred))^2)
+pred.Model.15c = sarima.for(chickenpox.train.pt, p=0, d=1, q=1, P=1, D=1, Q=1, S=52, n.ahead=52)
+pred.mse.15c = mean((chickenpox.test - exp(pred.Model.15c$pred))^2)
+```
+
+The following table summarizes the prediction MSEs of the chosen models.
+
+```{r}
+pred.mses = data.frame(Models=c("SARIMA(3,0,0)x(0,1,1)_52",
+                                "SARIMA(4,0,0)x(0,1,1)_52",
+                                "SARIMA(1,0,2)x(0,1,1)_52",
+                                "SARIMA(2,0,1)x(0,1,1)_52",
+                                "SARIMA(2,0,2)x(0,1,1)_52",
+                                "SARIMA(4,0,0)x(1,1,1)_52",
+                                "SARIMA(2,0,2)x(1,1,1)_52",
+                                "SARIMA(0,1,1)x(0,1,1)_52",
+                                "SARIMA(1,1,1)x(0,1,1)_52",
+                                "SARIMA(1,1,2)x(0,1,1)_52",
+                                "SARIMA(2,1,1)x(0,1,1)_52",
+                                "SARIMA(2,1,2)x(0,1,1)_52",
+                                "SARIMA(3,1,2)x(0,1,1)_52",
+                                "SARIMA(0,1,1)x(1,1,1)_52"),
+                       Pred.MSE=round(c(pred.mse.07b, pred.mse.08b, pred.mse.10b,
+                                        pred.mse.11b, pred.mse.12b, pred.mse.14b,
+                                        pred.mse.18b, pred.mse.08c, pred.mse.10c,
+                                        pred.mse.11c, pred.mse.12c, pred.mse.13c,
+                                        pred.mse.14c, pred.mse.15c), 2))
+knitr::kable(pred.mses)
+```
+
+The model $\text{SARIMA}(3,0,0)\times (0,1,1)_{52}$ leads to the lowest prediction MSE among all the proposed SARIMA models that pass the model diagnostics.
+
+```{r, results=FALSE}
+# Plot the predictions by SARIMA(3,0,0)x(0,1,1)_52
+fit = pred.Model.07b$pred
+plot(chickenpox.train, main="Weekly Chickenpox Cases in Hungary",
+     xlab="Weeks", ylab="Weekly chickenpox cases", xlim=c(2005,2015))
+lines(chickenpox.test, col="blue")
+lines(exp(fit), col='red', lty=2) 
+abline(v=2014+2/52, lty=3)
+legend("topleft", legend=c("Train","Test","Predicted"),
+       col=c("black", "blue", "red"), lty=c(1,1,2))
+```
+
+We close the Box-Jenkins section with a note: In both cases (additive and multiplicative) of Holt-Winters Algorithm, the residuals have unstable variance, so the approach of applying AR(I)MA models in combination with Holt-Winters for prediction is not promising in this case. We will skip this approach.
+
+
+## Forecast Beyond the Test Data
+
+In this section, we perform forecasting beyond the test data using the model that gives the lowest prediction MSE, namely ridge regression with polynomial of degree 6.
+
+### Forecast Country-Level Data
+
+Using ridge regression with polynomial of degree 6, we give a one-year ahead prediction of the number of country-level chickenpox cases beyond the test data.
+
+```{r, fig.keep='none'}
+# fit SARIMA(3,0,0)x(0,1,1)_52 on the entire dataset
+pred.Model = sarima.for(powerTransform(chickenpox, alpha),
+                        p=3, d=0, q=0, P=0, D=1, Q=1, S=52, n.ahead=52)
+fit = pred.Model$pred
+```
+
+```{r}
+# plot one year ahead prediction beyond the dataset
+plot(chickenpox, main="Weekly Chickenpox Cases in Hungary",
+     xlab="Weeks", ylab="Weekly chickenpox cases", xlim=c(2005,2016))
+lines(exp(fit), col='red', lty=2) 
+abline(v=2015+2/52, lty=3)
+legend("topright", legend=c("Observed","Predicted"),
+       col=c("black","red"), lty=c(1,2))
+```
+
+
+### Forecast County-Level Data
+
+To address the concern in the introduction section regarding whether the prediction model we found is applicable to the data for individual counties, we will apply the model we found to chickenpox cases in Budapest, which is the capital of Hungary.
+In particular, we apply ridge regression with polynomial degree 6 in terms of time points to one of the columns in the dataset.
+
+```{r}
+budapest = log(ts(df$BUDAPEST+1, start=c(2005,1), frequency = 52))
+budapest.training = budapest[1:(522-val_n)]
+Time.training = poly(Time, 6, simple=TRUE)[1:(522-val_n),]
+temp = data.frame(budapest.training, Time.training, Weeks.training)
+temp$Weeks.training = as.factor(temp$Weeks.training)
+x_train = model.matrix(~Time.training+Weeks.training, temp[,-1])[,-1]
+best.model= glmnet(x_train, budapest.training, alpha=0, lambda=Minimum.Lambda1[6, 1])
+Time.test = poly(1:(length(chickenpox)+52), 6, raw=FALSE, simple=TRUE)
+Weeks.test = as.factor(cycle(ts(rep(0,574), start=2005, frequency=52)))
+temp = data.frame(c(budapest,rep(0,52)), Time.test, Weeks.test)
+temp$Weeks.test = as.factor(temp$Weeks.test)
+x_test = model.matrix(~Time.test+Weeks.test, temp[,-1])[,-1]
+budapest.pred=predict(best.model, newx=x_test, s=Minimum.Lambda1[6, 1])
+plot(exp(budapest)-1, main='Chickenpox Cases for County Budapest',
+ylab='Budapest Chickenpox Cases', xlab="Time", xlim=c(2005,2016))
+lines(exp(ts(budapest.pred[(522-val_n+1):574], start=c(2014,3),
+
+frequency = 52))-1,col='red',lty=2)
+
+abline(v=2014+2/52, lty=3)
+legend("topright", col=c("black", "red"), lty=c(1,2),
+       legend=c("observed (training + test set)", 
+                "predicted (test set + future)"))
+```
+
+```{r}
+budapest.residuals = budapest.training-budapest.pred[1:(522-val_n)]
+shapiro.test(budapest.residuals)
+```
+
+The Shapiro test gives strong evidence against normality of the residuals.
+
+```{r}
+print(c('Budapest Prediction MSE',
+sum((exp(budapest[(522-val_n+1):522])-exp(budapest.pred[(522-val_n+1):522]))^2)/52))
+```
+The prediction MSE is $3139.98$ .
+
+The model seems to pick up the general trend well. The prediction MSE for the test data is only $3139.98$. This shows that the model we found is able to produce reliable predictions for the Budapest data. However, we only considered one county. We suppose that the model we found will not perform well for counties that show drastically different patterns than the mainstream in terms of chickenpox cases.
+
+\newpage
+
+# Conclusion
+
+Based on the prediction MSE of each model proposed, ridge regression with polynomial of degree 6 turns out to be the best model to employ. For that specific model, the modeling process is as follows:  
+
+1. We stabilize the variance of the data using log transformation.
+
+2. We apply ridge regression to the log transformed data, using the orthogonal polynomial of degree 6 of the time points plus 51 indicator variables for weeks of the year.
+
+3. We apply the inverse transformation $e^{Y_t}$ to the fitted values $Y_t$ in order to get the final prediction data.
+
+\ 
+
+The ridge regression with polynomial degree 6 model is able to give a reliable point forecast of the number of Hungarian chickenpox cases at the country level, although no prediction intervals are given.  
+

@@ -1,0 +1,217 @@
+---
+title: "Power Transformation and Influential Points"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE,results="hold")
+```
+
+This document explores power transformation and influential points. We will use the US economic mobility data set.
+
+```{r}
+# load data set
+# directory may be different
+directory <- "../datasets"
+dirsep <-"/"
+filename <- paste(directory, "EconomicMobility.csv", sep=dirsep)
+mobility <- read.csv(filename, header=TRUE, stringsAsFactors=TRUE)
+```
+
+```{r fig1, fig.height = 9, fig.width = 5}
+par(mfrow=c(2,1))
+
+# takes a vector of break points which defines the intervals,
+#  and data, outputs a vector of categories that each data
+#  point falls in
+categorize <- function(x, breakpoints) {
+  category <- 1
+  categories <- rep(category, length(x))
+  for (point in breakpoints) {
+    category = category + 1
+    categories[x > point] = category
+  }
+  return(categories)
+}
+
+# first plot, Latitude vs Longitude, categorized by population
+popBP <- c(100000,500000,5000000)
+# category of each data point
+popCategories <- categorize(mobility$Population, popBP)
+plot(mobility$Longitude,
+     mobility$Latitude,
+     main="Longitude vs. Latitude of US Communities",
+     pch=19, cex.main=0.9,
+     col=adjustcolor(popCategories,alpha=0.4),
+     xlab="x = Longitude",
+     ylab="y = Latitude")
+legend("topright",
+       legend=c("Population",
+                expression(""<="100,000"),
+                expression(""%in%"(100,000 , 500,000]"),
+                expression(""%in%"(500,000 , 5,000,000]"),
+                expression("">"5,000,000")),
+       col=0:4, cex=0.7, pch=19, bty = "y")
+
+# second plot, Latitude vs Longitude, categorized by commute time
+comBP <- c(0.25,0.5,0.75)
+# category of each data point
+comCategories <- categorize(mobility$Commute, comBP)
+plot(mobility$Longitude,
+     mobility$Latitude,
+     main="Longitude vs. Latitude of US Communities",
+     pch=19, cex.main=0.9,
+     col=adjustcolor(comCategories,alpha=0.4),
+     xlab="x = Longitude",
+     ylab="y = Latitude")
+legend("topright",
+       legend=c("<15min commuter proportion",
+                expression(""<="0.25"),
+                expression(""%in%"(0.25 , 0.5]"),
+                expression(""%in%"(0.5 , 0.75]"),
+                expression("">"0.75")),
+       col=0:4, cex=0.7, pch=19, bty = "y")
+```
+
+Above are two scatter plots. We can see from the first plot that middle US and Alaska appear to have very low population, south-eastern US and Hawaii generally have low population, north-eastern US and south-western US has relatively high population, and certain large cities in the US have very large population. There appear to be more communities in eastern US than in western US.
+
+We can see from the second plot that Alaska has very high proportions of workers with a commute time less than 15 minutes. Middle US generally have high proportions. Eastern US and north-western US generally have low proportions. Certain large cities in the US have very low proportions.
+
+There appears to be an inverse relationship between the two variables $\texttt{commute}$ and $\texttt{population}$. The less populated the communities, usually the higher proportion of workers with a commute of less than 15 minutes.
+
+
+Define a power transformation function.
+
+```{r}
+# one-d power function, takes a vector, and alpha
+powerfun <- function(x, alpha) {
+  if (sum(x <= 0) > 1) {
+    stop("x must be positive")
+  }
+  if (alpha == 0) {
+    log(x) 
+  } else if (alpha > 0) {
+    x^alpha
+  } else {
+    -x^alpha
+  }
+}
+
+# creates a two-d power function, 
+#  takes a table of two columns, alpha_x, and alpha_y, 
+#  returns the power transformed table
+createPowerfun2 <- function(xy) {
+  powerfun2 <- function(theta) {
+    data.frame(x=powerfun(xy[,1], theta[1]), # alpha_x
+               y=powerfun(xy[,2], theta[2])) # alpha_y
+  }
+}
+```
+
+```{r}
+par(mfrow=c(1,2))
+
+# first plot, Population vs. <15 Commuter Proportion
+plot(mobility$Population,
+     mobility$Commute,
+     main="Population vs. <15min Commuter Proportion",
+     pch=19, cex.main=0.7, cex.lab=0.8,
+     col=adjustcolor("black",alpha=0.4),
+     xlab="x = Population",
+     ylab="y = <15min Commuter Proportion")
+
+# second plot, Transformed Population vs. <15 Commuter Proportion
+powerfun2 <- createPowerfun2(mobility[,c("Population","Commute")])
+theta <- c(-1/2, -1/2) # alpha_x, alpha_y
+transformed <- powerfun2(theta)
+plot(transformed$x,
+     transformed$y,
+     main="Transformed Population vs. <15min Commuter Proportion",
+     pch=19, cex.main=0.6, cex.lab=0.8,
+     col=adjustcolor("black",alpha=0.4),
+     xlab=bquote("x = (Population)"^.(theta[1])),
+     ylab=bquote("y = (<15min Commuter Proportion)"^.(theta[2])))
+```
+
+We will generate the power-transformed data $T_{\alpha_x}(x), T_{\alpha_y}(y)$ which have the strongest linear relationship measured by $L = 1 - \rho_{XY}^2$ .
+
+```{r}
+# objective function, L
+L <- function(theta) {
+  transformed <- powerfun2(theta)
+  1 - (cor(transformed$x, transformed$y))^2
+}
+
+# optimize L
+op <- nlminb(start=c(1,1), objective=L)
+op
+```
+
+The optimum value of $\alpha_x$ is $0.130$ .
+The optimum value of $\alpha_y$ is $-0.601$ .
+
+```{r}
+par(mfrow=c(1,2))
+
+# first plot, Population vs. <15 Commuter Proportion
+correlation <- cor(mobility$Population, mobility$Commute)
+correlation
+plot(mobility$Population,
+     mobility$Commute,
+     main="Population vs. <15min Commuter Proportion",
+     pch=19, cex.main=0.7, cex.lab=0.8,
+     col=adjustcolor("black",alpha=0.4),
+     xlab="x = Population",
+     ylab="y = <15min Commuter Proportion")
+legend("topright", bty="n",
+       legend=bquote(rho[xy] == .(correlation)))
+
+# second plot, Transformed Population vs. <15 Commuter Proportion
+theta <- c(op$par[1], op$par[2]) # alpha_x, alpha_y
+transformed <- powerfun2(theta)
+correlation <- cor(transformed$x, transformed$y)
+correlation
+plot(transformed$x,
+     transformed$y,
+     main="Transformed Population vs. <15min Commuter Proportion",
+     pch=19, cex.main=0.6,cex.lab=0.8,
+     col=adjustcolor("black",alpha=0.4),
+     xlab=bquote("x = (Population)"^.(op$par[1])),
+     ylab=bquote("y = (<15min Commuter Proportion)"^.(op$par[2])))
+legend("topright", bty="n",
+       legend=bquote(rho[xy] == .(correlation)))
+```
+
+The correlation coefficient for the original data is $-0.41$ .
+The correlation coefficient for the power-transformed data is $-0.83$ .
+
+Now, we look at the influence that each data point has on the correlation of the entire data set.
+
+```{r}
+delta <- sapply(1:nrow(mobility), 
+                function(i) cor(mobility[-i,"Population"],
+                                mobility[-i,"Commute"]))
+delta <- cor(mobility[,"Population"], mobility[,"Commute"]) - delta
+plot(delta,
+     main="Influence of (Population,Commute) on Correlation Coefficient",
+     pch=19,cex.lab=0.8,
+     col=adjustcolor("black",alpha=0.4),
+     xlab="Index i",
+     ylab="Influence of i-th (Population,Commute) on Correlation Coefficient")
+```
+
+\newpage
+
+```{r}
+# table of influential points
+library(knitr)
+popCom <- mobility[,c("Name","Population","Commute")]
+kable(cbind(popCom[abs(delta) > 0.004,],
+            delta[abs(delta) > 0.004]),
+      col.names=c("Name","Population", "Commute", "Influence"))
+```
+
+There are a few influential points. The points in general correspond to large communities in the US. The absolute value of the influence of those points on the correlation coefficient $\rho_{XY}$ is greater than $0.004$ . The population values of those points are large compared to the rest of the points. Those influential points are located at the right tail of the left-hand-side scatter plot in part (c), and they are off the line roughly formed by the rest of the points. This explains why they have large influences on the corresponding correlation coefficient. Notably, the $707^{th}$ point (corresponding to Los Angeles) has a really large proportion of workers with a commute time of $<15$ minutes, compared to its population.
+
